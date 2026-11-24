@@ -22,7 +22,7 @@ Automatic placement tries MacBook, Mac mini, then the Orca daemon on Hermes Clou
 Install this plugin and use AutoLinear 1.4.4 or newer if AutoLinear is enabled.
 
 ```sh
-hermes plugins install leonsiliconAI/slack22orca --enable
+hermes plugins install leonsiliconAI/hermes-plugin-slack22orca --enable
 ```
 
 The gateway must have its existing Slack app and `chat:write`. Set `SLACK22ORCA_USER_ID` to the Slack user allowed to delegate. An existing `AUTOLINEAR_USER_ID` supplies the default. Restart the Hermes gateway after installation. Its log should show `slack22orca: Slack thread relay registered`. Verify with a short `!orca cloud` task.
