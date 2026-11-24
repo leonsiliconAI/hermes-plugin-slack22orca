@@ -108,3 +108,54 @@ def call(filename, function, *args):
 
 async def acall(filename, function, *args):
     return await asyncio.wrap_future(_submit(filename, function, args))
+
+
+def blocking(function):
+    """Expose a blocking Python operation as a Promise without blocking PythonMonkey."""
+    async def invoke(*values):
+        _, engine = _engine()
+        return await asyncio.to_thread(function, *(_native(value, engine) for value in values))
+
+    return invoke
+
+
+def on_host(function):
+    """Expose an operation on the calling asyncio loop, where Hermes owns its clients."""
+    host_loop = asyncio.get_running_loop()
+
+    async def invoke(*values):
+        _, engine = _engine()
+        args = tuple(_native(value, engine) for value in values)
+
+        async def run():
+            result = function(*args)
+            return await result if inspect.isawaitable(result) else result
+
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(run(), host_loop))
+
+    return invoke
+
+
+async def acall_with_host(filename, function, callbacks, *args, immediate=None):
+    """Call a workflow whose native operations have to finish on the Hermes loop."""
+    error = None
+
+    def bind(callback):
+        async def invoke(*values):
+            nonlocal error
+            try:
+                result = callback(*values)
+                return await result if inspect.isawaitable(result) else result
+            except Exception as exc:
+                error = exc
+                raise
+        return on_host(invoke)
+
+    host = {name: bind(callback) for name, callback in callbacks.items()}
+    host.update(immediate or {})
+    try:
+        return await acall(filename, function, host, *args)
+    except Exception:
+        if error is not None:
+            raise error from None
+        raise

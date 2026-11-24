@@ -13,7 +13,7 @@ import sqlite3
 import time
 from contextlib import closing, contextmanager, suppress
 
-from ._pythonmonkey import acall, call
+from ._pythonmonkey import acall, call, on_host
 
 logger = logging.getLogger(__name__)
 TARGETS = ("macbook", "mini", "cloud")
@@ -168,132 +168,35 @@ class Relay:
         self.orca = orca
         self.adapter = adapter
 
-    async def prepare(self, job):
-        hosts = TARGETS if job["target"] == "auto" else (job["target"],)
-        failures = []
-        for host in hosts:
-            try:
-                inventory = await self.orca.call(host, "repo", "list")
-                repo = call(__file__, "repository", inventory.get("repos", []), job["repo"])
-                if "error" in repo:
-                    failures.append(f"{host}: {repo['error']}")
-                    continue
-                inventory = await self.orca.call(host, "agent", "installed")
-                if not any(agent.get("id") == "codex" for agent in inventory.get("agents", [])):
-                    failures.append(f"{host}: Codex unavailable")
-                    continue
-            except OrcaError as exc:
-                logger.info("slack22orca: %s preflight on %s failed (%s)", job["id"], host, exc)
-                failures.append(f"{host}: unreachable")
-                continue
-            # Persist the host before the first mutating call. An ambiguous launch must stay here.
-            job.update(state="launching", host=host, repo_id=repo["id"], due=0)
-            self.store.save(job)
-            await self.launch(job, initial=True)
-            return
-        self.finish(job, "Orca could not start this task. " + "; ".join(failures) + ".")
-
-    async def launch(self, job, *, initial=False):
-        operation = job.get("operation")
-        if not initial and not operation:
-            await self.recover_launch(job)
-            return
-        args = [
-            "worktree", "create", "--repo", f"id:{job['repo_id']}",
-            "--name", f"slack22orca-{job['id']}", "--no-parent", "--setup", "skip",
-            "--agent", "codex", "--surface", "chat", "--prompt", job["prompt"],
-        ]
-        if operation:
-            args.extend(("--retry-launch", operation))
-        try:
-            result = await self.orca.call(job["host"], *args, timeout=65)
-        except OrcaError as exc:
-            logger.info("slack22orca: %s launch on %s returned %s", job["id"], job["host"], exc)
-            retry = exc.data.get("operationId")
-            if isinstance(retry, str) and retry and not operation:
-                job.update(operation=retry, due=time.time() + POLL_SECONDS)
-            else:
-                job.update(operation=None, due=time.time() + POLL_SECONDS)
-            self.store.save(job)
-            return
-        session = call(__file__, "launchSession", result)
-        if session:
-            self.started(job, session)
-            return
-        job.update(operation=None, due=time.time() + POLL_SECONDS)
-        self.store.save(job)
-
-    async def recover_launch(self, job):
-        """Check only this job's fresh workspace; never submit its prompt a second time."""
-        try:
-            result = await self.orca.call(
-                job["host"], "worktree", "show", "--worktree", f"name:slack22orca-{job['id']}",
-            )
-            worktree = (result.get("worktree") or {}).get("id")
-            if worktree:
-                result = await self.orca.call(job["host"], "agent", "list", "--worktree", f"id:{worktree}")
-                session = call(__file__, "recoveredSession", result.get("agents", []))
-                if session:
-                    self.started(job, session)
-                    return
-        except OrcaError:
-            pass
-        attempts = job.get("recovery_attempts", 0) + 1
-        if attempts >= 4:
-            self.finish(
-                job, f"Orca could not confirm the launch on {job['host']}. "
-                f"Check workspace slack22orca-{job['id']} on that host.",
-            )
-        else:
-            job.update(recovery_attempts=attempts, due=time.time() + 5)
-            self.store.save(job)
-
-    def started(self, job, session):
-        session = session.removeprefix("orca_session_id:")
-        job.update(state="reading", session=session, previous=[], due=0)
-        job.pop("prompt", None)
-        job.pop("operation", None)
-        self.store.save(job, f"Orca started Codex on {job['host']} (orca_session_id:{session}).")
-
     def finish(self, job, *messages):
-        job.update(state="done", due=0)
-        for key in ("prompt", "operation", "previous"):
-            job.pop(key, None)
+        snapshot = call(__file__, "finishedState", job)
+        job.clear()
+        job.update(snapshot)
         self.store.save(job, *messages)
 
-    async def read(self, job):
-        try:
-            page = await self.orca.call(
-                job["host"], "agent", "read", f"orca_session_id:{job['session']}",
-                "--limit", str(TRANSCRIPT_LIMIT),
-            )
-        except OrcaError as exc:
-            if not job.get("read_unavailable"):
-                logger.info("slack22orca: %s transcript temporarily unavailable (%s)", job["id"], exc)
-            job.update(read_unavailable=True, due=time.time() + 20)
-            self.store.save(job)
-            return
-        job.pop("read_unavailable", None)
-        previous, new, gap = transcript_update(job["previous"], page["entries"], page.get("limited"))
-        messages = await acall(__file__, "transcriptMessages", new, gap)
-        if page.get("state") == "done":
-            self.finish(job, *messages, "Orca finished the turn.")
-        else:
-            job.update(previous=previous, due=time.time() + POLL_SECONDS)
-            self.store.save(job, *messages)
-
     async def tick(self, job):
+        async def command(device, args, timeout):
+            try:
+                return {"value": await self.orca.call(device, *args, timeout=timeout)}
+            except OrcaError as exc:
+                return {"error": str(exc), "retry": exc.data.get("operationId")}
+
+        def save(snapshot, messages):
+            self.store.save(snapshot, *messages)
+            job.clear()
+            job.update(snapshot)
+
+        host = {
+            "command": on_host(command), "save": on_host(save),
+            "keys": on_host(lambda entries: [_entry_key(entry) for entry in entries]),
+            "now": lambda: time.time(),
+            "log": lambda message: logger.info("slack22orca: %s", message),
+        }
         try:
-            if job["state"] == "queued":
-                await self.prepare(job)
-            elif job["state"] == "launching":
-                await self.launch(job)
-            else:
-                await self.read(job)
+            await acall(__file__, "advance", host, job, list(TARGETS), POLL_SECONDS, TRANSCRIPT_LIMIT)
         except Exception:
             logger.exception("slack22orca: could not advance job %s", job["id"])
-            job["due"] = time.time() + 20
-            self.store.save(job)
+            save(call(__file__, "deferJob", job, time.time()), [])
 
     async def deliver(self, seq, text, job):
         channel, team = job["channel"], job["team"]

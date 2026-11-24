@@ -9,5 +9,9 @@ export default defineConfig({
     clean: false,
     dts: false,
     fixedExtension: true,
+    // Keep module names identical in the workspace and in standalone mirrors.
+    inputOptions(options) {
+      return { ...options, resolve: { ...options.resolve, symlinks: false } };
+    },
   },
 });

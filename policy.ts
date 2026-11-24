@@ -1,3 +1,5 @@
+import { slackPermalink } from "./slack.ts";
+
 interface Entry {
   kind?: string;
   role?: string;
@@ -132,10 +134,8 @@ export function delegation(request: Request, owner: string, targets: string[], l
       "This task was delegated by Hermes from Slack. Your user-visible messages will be relayed " +
       "into the original Slack thread as you work. Keep progress and the final result useful for " +
       "that audience, and keep secrets out of your messages.\n\n" +
-      "Slack request: https://app.slack.com/archives/" +
-      channel +
-      "/p" +
-      message.replaceAll(".", "") +
+      "Slack request: " +
+      slackPermalink(channel, message) +
       "\n\n" +
       task.trim(),
   };
@@ -143,4 +143,190 @@ export function delegation(request: Request, owner: string, targets: string[], l
 
 export function slackRetry(delay: string) {
   return /^\d+$/.test(delay) ? Math.max(1, Number(delay)) : 30;
+}
+
+interface Job {
+  id: string;
+  state: string;
+  due: number;
+  repo: string;
+  target: string;
+  host: string;
+  repo_id?: string;
+  operation?: string | null;
+  prompt?: string;
+  session?: string;
+  previous?: string[];
+  recovery_attempts?: number;
+  read_unavailable?: boolean;
+}
+
+type OrcaResponse<T> = { value: T; error?: undefined } | { error: string; retry?: string };
+interface OrcaHost {
+  command<T>(host: string, args: string[], timeout: number): Promise<OrcaResponse<T>>;
+  save(job: Job, messages: string[]): Promise<void>;
+  keys(entries: Entry[]): Promise<string[]>;
+  now(): number;
+  log(message: string): void;
+}
+
+export function finishedState(job: Job) {
+  const next = { ...job, state: "done", due: 0 };
+  delete next.prompt;
+  delete next.operation;
+  delete next.previous;
+  return next;
+}
+
+async function started(host: OrcaHost, job: Job, session: string) {
+  session = session.replace(/^orca_session_id:/, "");
+  const next = { ...job, state: "reading", session, previous: [], due: 0 };
+  delete next.prompt;
+  delete next.operation;
+  await host.save(next, [
+    "Orca started Codex on " + job.host + " (orca_session_id:" + session + ").",
+  ]);
+}
+
+async function recover(host: OrcaHost, job: Job) {
+  const workspace = await host.command<{ worktree?: { id?: string } }>(
+    job.host,
+    ["worktree", "show", "--worktree", "name:slack22orca-" + job.id],
+    12,
+  );
+  const id = workspace.error === undefined && workspace.value.worktree?.id;
+  if (id) {
+    const result = await host.command<{ agents?: { kind?: string; orcaSessionId?: string }[] }>(
+      job.host,
+      ["agent", "list", "--worktree", "id:" + id],
+      12,
+    );
+    const session = result.error === undefined && recoveredSession(result.value.agents ?? []);
+    if (session) {
+      await started(host, job, session);
+      return;
+    }
+  }
+  const attempts = (job.recovery_attempts ?? 0) + 1;
+  if (attempts >= 4) {
+    await host.save(finishedState(job), [
+      "Orca could not confirm the launch on " +
+        job.host +
+        ". Check workspace slack22orca-" +
+        job.id +
+        " on that host.",
+    ]);
+  } else {
+    await host.save({ ...job, recovery_attempts: attempts, due: host.now() + 5 }, []);
+  }
+}
+
+async function launch(host: OrcaHost, job: Job, first: boolean, poll: number) {
+  const { operation } = job;
+  if (!first && !operation) {
+    await recover(host, job);
+    return;
+  }
+  const args = [
+    "worktree",
+    "create",
+    "--repo",
+    "id:" + job.repo_id,
+    "--name",
+    "slack22orca-" + job.id,
+    "--no-parent",
+    "--setup",
+    "skip",
+    "--agent",
+    "codex",
+    "--surface",
+    "chat",
+    "--prompt",
+    job.prompt ?? "",
+  ];
+  if (operation) args.push("--retry-launch", operation);
+  const result = await host.command<Parameters<typeof launchSession>[0]>(job.host, args, 65);
+  if (result.error !== undefined) {
+    host.log(job.id + " launch on " + job.host + " returned " + result.error);
+    const retry = !operation && typeof result.retry === "string" && result.retry;
+    await host.save({ ...job, operation: retry || null, due: host.now() + poll }, []);
+    return;
+  }
+  const session = launchSession(result.value);
+  if (session) await started(host, job, session);
+  else await host.save({ ...job, operation: null, due: host.now() + poll }, []);
+}
+
+async function prepare(host: OrcaHost, job: Job, targets: string[], poll: number) {
+  const failures = [];
+  for (const name of job.target === "auto" ? targets : [job.target]) {
+    const repos = await host.command<{ repos?: Repository[] }>(name, ["repo", "list"], 12);
+    const repo =
+      repos.error === undefined ? repository(repos.value.repos ?? [], job.repo) : undefined;
+    if (repo?.error) {
+      failures.push(name + ": " + repo.error);
+      continue;
+    }
+    const agents = repo
+      ? await host.command<{ agents?: { id?: string }[] }>(name, ["agent", "installed"], 12)
+      : undefined;
+    if (agents?.error !== undefined || repos.error !== undefined) {
+      const error = agents?.error ?? repos.error;
+      host.log(job.id + " preflight on " + name + " failed (" + error + ")");
+      failures.push(name + ": unreachable");
+      continue;
+    }
+    if (!agents?.value.agents?.some((agent) => agent.id === "codex")) {
+      failures.push(name + ": Codex unavailable");
+      continue;
+    }
+    // Persist the host before a mutating call. An ambiguous launch stays on that host.
+    const selected = { ...job, state: "launching", host: name, repo_id: repo?.id, due: 0 };
+    await host.save(selected, []);
+    await launch(host, selected, true, poll);
+    return;
+  }
+  await host.save(finishedState(job), [
+    "Orca could not start this task. " + failures.join("; ") + ".",
+  ]);
+}
+
+async function read(host: OrcaHost, job: Job, poll: number, limit: number) {
+  const response = await host.command<{ limited?: boolean; entries: Entry[]; state?: string }>(
+    job.host,
+    ["agent", "read", "orca_session_id:" + job.session, "--limit", String(limit)],
+    12,
+  );
+  if (response.error !== undefined) {
+    if (!job.read_unavailable)
+      host.log(job.id + " transcript temporarily unavailable (" + response.error + ")");
+    await host.save({ ...job, read_unavailable: true, due: host.now() + 20 }, []);
+    return;
+  }
+  const page = response.value;
+  const keys = await host.keys(page.entries);
+  const overlap = transcriptOverlap(job.previous ?? [], keys, Boolean(page.limited));
+  const messages = transcriptMessages(page.entries.slice(overlap.start), overlap.gap);
+  delete job.read_unavailable;
+  if (page.state === "done") {
+    await host.save(finishedState(job), [...messages, "Orca finished the turn."]);
+  } else {
+    await host.save({ ...job, previous: keys, due: host.now() + poll }, messages);
+  }
+}
+
+export async function advance(
+  host: OrcaHost,
+  job: Job,
+  targets: string[],
+  poll: number,
+  limit: number,
+) {
+  if (job.state === "queued") await prepare(host, job, targets, poll);
+  else if (job.state === "launching") await launch(host, job, false, poll);
+  else await read(host, { ...job }, poll, limit);
+}
+
+export function deferJob(job: Job, now: number) {
+  return { ...job, due: now + 20 };
 }
