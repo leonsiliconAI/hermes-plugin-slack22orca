@@ -1,0 +1,5 @@
+name: slack22orca
+label: slack22orca
+version: 1.0.0
+description: Delegate Slack tasks to Orca from Hermes Cloud and relay agent messages to their original Slack thread.
+author: leonsilicon
