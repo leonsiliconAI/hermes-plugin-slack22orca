@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import sys
 import json
 import os
 import tempfile
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 spec = importlib.util.spec_from_file_location("slack22orca", Path(__file__).parents[1] / "__init__.py")
 plugin = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
 
 REPO = {"id": "repo", "kind": "git", "displayName": "demo"}

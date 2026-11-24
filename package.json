@@ -1,0 +1,11 @@
+{
+  "name": "@-/com.leonsilicon.hermes.plugins.slack22orca",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vp pack"
+  },
+  "devDependencies": {
+    "vite-plus": "1.5.0"
+  }
+}

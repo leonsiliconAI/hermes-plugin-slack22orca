@@ -9,18 +9,17 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sqlite3
 import time
 from contextlib import closing, contextmanager, suppress
+
+from ._pythonmonkey import acall, call
 
 logger = logging.getLogger(__name__)
 TARGETS = ("macbook", "mini", "cloud")
 POLL_SECONDS = 3
 TRANSCRIPT_LIMIT = 100
 TASK_LIMIT = 12_000
-SLACK_TS = re.compile(r"[0-9]+\.[0-9]{6}")
-SLACK_CHANNEL = re.compile(r"[CDG][A-Z0-9]+")
 
 
 class OrcaError(Exception):
@@ -155,27 +154,12 @@ def _entry_key(entry):
 def transcript_update(previous, entries, limited):
     """Find the overlap with Orca's newest-entry window and preserve repeated messages."""
     keys = [_entry_key(entry) for entry in entries]
-    if not limited:
-        for seen, current in zip(previous, keys):
-            if seen != current:
-                break
-        else:
-            return keys, entries[len(previous):], False
-    for size in range(min(len(previous), len(keys)), 0, -1):
-        if previous[-size:] == keys[:size]:
-            return keys, entries[size:], False
-    return keys, entries, bool(limited or previous)
+    overlap = call(__file__, "transcriptOverlap", previous, keys, bool(limited))
+    return keys, entries[int(overlap["start"]):], overlap["gap"]
 
 
 def slack_chunks(text):
-    while text:
-        end = min(len(text), 3800)
-        if end < len(text):
-            newline = text.rfind("\n", 3000, end)
-            if newline != -1:
-                end = newline + 1
-        yield "Orca\n" + text[:end]
-        text = text[end:]
+    yield from call(__file__, "slackChunks", text)
 
 
 class Relay:
@@ -190,14 +174,9 @@ class Relay:
         for host in hosts:
             try:
                 inventory = await self.orca.call(host, "repo", "list")
-                matches = [
-                    repo for repo in inventory.get("repos", [])
-                    if repo.get("kind") == "git" and job["repo"] in (
-                        repo.get("displayName"), (repo.get("gitRemoteIdentity") or {}).get("canonicalKey"),
-                    )
-                ]
-                if len(matches) != 1:
-                    failures.append(f"{host}: repository {'ambiguous' if matches else 'missing'}")
+                repo = call(__file__, "repository", inventory.get("repos", []), job["repo"])
+                if "error" in repo:
+                    failures.append(f"{host}: {repo['error']}")
                     continue
                 inventory = await self.orca.call(host, "agent", "installed")
                 if not any(agent.get("id") == "codex" for agent in inventory.get("agents", [])):
@@ -208,7 +187,7 @@ class Relay:
                 failures.append(f"{host}: unreachable")
                 continue
             # Persist the host before the first mutating call. An ambiguous launch must stay here.
-            job.update(state="launching", host=host, repo_id=matches[0]["id"], due=0)
+            job.update(state="launching", host=host, repo_id=repo["id"], due=0)
             self.store.save(job)
             await self.launch(job, initial=True)
             return
@@ -237,13 +216,10 @@ class Relay:
                 job.update(operation=None, due=time.time() + POLL_SECONDS)
             self.store.save(job)
             return
-        launch = result.get("launch") or {}
-        outcome = launch.get("outcome") or {}
-        if outcome.get("kind") == "structured" and launch.get("prompt", {}).get("outcome") == "journaled":
-            session = outcome.get("sessionId")
-            if session:
-                self.started(job, session)
-                return
+        session = call(__file__, "launchSession", result)
+        if session:
+            self.started(job, session)
+            return
         job.update(operation=None, due=time.time() + POLL_SECONDS)
         self.store.save(job)
 
@@ -256,9 +232,9 @@ class Relay:
             worktree = (result.get("worktree") or {}).get("id")
             if worktree:
                 result = await self.orca.call(job["host"], "agent", "list", "--worktree", f"id:{worktree}")
-                agents = [agent for agent in result.get("agents", []) if agent.get("kind") == "chat"]
-                if len(agents) == 1 and agents[0].get("orcaSessionId"):
-                    self.started(job, agents[0]["orcaSessionId"])
+                session = call(__file__, "recoveredSession", result.get("agents", []))
+                if session:
+                    self.started(job, session)
                     return
         except OrcaError:
             pass
@@ -299,12 +275,7 @@ class Relay:
             return
         job.pop("read_unavailable", None)
         previous, new, gap = transcript_update(job["previous"], page["entries"], page.get("limited"))
-        messages = []
-        if gap:
-            messages.append("Orca’s transcript changed or exceeded its readable window. Some earlier messages may be missing.")
-        for entry in new:
-            if entry.get("kind") == "message" and entry.get("role") == "assistant" and entry.get("text"):
-                messages.extend(slack_chunks(entry["text"]))
+        messages = await acall(__file__, "transcriptMessages", new, gap)
         if page.get("state") == "done":
             self.finish(job, *messages, "Orca finished the turn.")
         else:
@@ -341,7 +312,7 @@ class Relay:
         except Exception as exc:
             headers = getattr(getattr(exc, "response", None), "headers", {}) or {}
             delay = headers.get("Retry-After", headers.get("retry-after", "30"))
-            self.store.defer_message(seq, max(1, int(delay)) if str(delay).isdigit() else 30)
+            self.store.defer_message(seq, int(call(__file__, "slackRetry", str(delay))))
             logger.warning("slack22orca: Slack delivery deferred for %s (%s)", job["id"], type(exc).__name__)
         else:
             self.store.delivered(seq)
@@ -376,32 +347,20 @@ class Relay:
 
 def submit(store, *, channel, thread, message, team, actor, target, repo, task):
     allowed = os.getenv("SLACK22ORCA_USER_ID") or os.getenv("AUTOLINEAR_USER_ID")
-    if not actor or actor != allowed:
-        return {"error": "Orca delegation is available to the configured Slack user."}
-    if not (SLACK_CHANNEL.fullmatch(channel or "") and SLACK_TS.fullmatch(thread or "")
-            and SLACK_TS.fullmatch(message or "")):
-        return {"error": "Orca delegation needs a Slack message and its thread."}
-    if target not in ("auto", *TARGETS) or not isinstance(task, str) or not task.strip():
-        return {"error": "Usage: !orca [auto|macbook|mini|cloud] [repo=<name>] <task>"}
-    if len(task) > TASK_LIMIT or "\0" in task:
-        return {"error": f"Task must be at most {TASK_LIMIT} characters and contain no NUL."}
-    if not isinstance(repo, str) or len(repo) > 250:
-        return {"error": "Use a registered Orca repository name or its canonical Git remote."}
+    request = call(__file__, "delegation", {
+        "channel": channel, "thread": thread, "message": message, "actor": actor,
+        "target": target, "repo": repo, "task": task,
+    }, allowed, list(TARGETS), TASK_LIMIT)
+    if "error" in request:
+        return request
     if store is None:
         return {"error": "Orca delegation is unavailable until the Slack adapter connects."}
     repo = repo or os.getenv("SLACK22ORCA_REPO", "leonsilicon.ai")
     key = json.dumps([team, channel, message])
     job_id = hashlib.sha256(key.encode()).hexdigest()[:16]
-    prompt = (
-        "This task was delegated by Hermes from Slack. Your user-visible messages will be relayed "
-        "into the original Slack thread as you work. Keep progress and the final result useful for "
-        "that audience, and keep secrets out of your messages.\n\n"
-        f"Slack request: https://app.slack.com/archives/{channel}/p{message.replace('.', '')}\n\n"
-        f"{task.strip()}"
-    )
     fresh = store.add({
         "id": job_id, "state": "queued", "due": 0, "channel": channel, "team": team,
-        "thread": thread, "target": target, "repo": repo, "prompt": prompt,
+        "thread": thread, "target": target, "repo": repo, "prompt": request["prompt"],
     })
     return {"status": "queued" if fresh else "already_queued", "job": job_id}
 
@@ -415,18 +374,11 @@ def register(ctx):
     def command(raw_args, *, source=None, platform=None):
         if platform != "slack" or source is None or source.is_bot:
             return "Run !orca from a Slack conversation."
-        task = raw_args.strip()
-        target, repo = "auto", ""
-        first = task.split(maxsplit=1)
-        if first and first[0] in ("auto", *TARGETS):
-            target, task = first[0], (first[1] if len(first) == 2 else "")
-        if task.startswith("repo="):
-            first = task[5:].split(maxsplit=1)
-            repo, task = (first[0] if first else ""), (first[1] if len(first) == 2 else "")
+        args = call(__file__, "command", raw_args, list(TARGETS))
         result = enqueue(
             channel=source.chat_id, thread=source.thread_id or source.message_id,
             message=source.message_id, team=source.scope_id or "", actor=source.user_id,
-            target=target, repo=repo, task=task,
+            **args,
         )
         return result.get("error") or f"Orca {result['status'].replace('_', ' ')} ({result['job']})."
 
