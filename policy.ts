@@ -1,4 +1,4 @@
-import { slackPermalink } from "./slack.ts";
+import { slackPermalink } from "#slack";
 
 interface Entry {
   kind?: string;

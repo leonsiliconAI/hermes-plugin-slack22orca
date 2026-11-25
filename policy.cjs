@@ -1,5 +1,5 @@
 Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
-// slack.ts
+// \0hermes-slack.ts
 function slackPermalink(channel, ts) {
 	return "https://app.slack.com/archives/" + channel + "/p" + ts.replaceAll(".", "");
 }

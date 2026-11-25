@@ -2,6 +2,9 @@
   "name": "@-/com.leonsilicon.hermes.plugins.slack22orca",
   "private": true,
   "type": "module",
+  "imports": {
+    "#slack": "./slack.ts"
+  },
   "scripts": {
     "build": "vp pack"
   },
