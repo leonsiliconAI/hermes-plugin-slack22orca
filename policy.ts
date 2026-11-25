@@ -124,7 +124,7 @@ export function delegation(request: Request, owner: string, targets: string[], l
     typeof task !== "string" ||
     !task.trim()
   )
-    return { error: "Usage: !orca [auto|macbook|mini|cloud] [repo=<name>] <task>" };
+    return { error: "Usage: !orca [auto|macbook|mini|cloud|desktop] [repo=<name>] <task>" };
   if (Array.from(task).length > limit || task.includes("\0"))
     return { error: "Task must be at most " + limit + " characters and contain no NUL." };
   if (typeof repo !== "string" || Array.from(repo).length > 250)
@@ -257,12 +257,16 @@ async function launch(host: OrcaHost, job: Job, first: boolean, poll: number) {
   else await host.save({ ...job, operation: null, due: host.now() + poll }, []);
 }
 
-async function prepare(host: OrcaHost, job: Job, targets: string[], poll: number) {
+export async function findPlacement(
+  host: Pick<OrcaHost, "command" | "log">,
+  targets: string[],
+  repoName: string,
+) {
   const failures = [];
-  for (const name of job.target === "auto" ? targets : [job.target]) {
+  for (const name of targets) {
     const repos = await host.command<{ repos?: Repository[] }>(name, ["repo", "list"], 12);
     const repo =
-      repos.error === undefined ? repository(repos.value.repos ?? [], job.repo) : undefined;
+      repos.error === undefined ? repository(repos.value.repos ?? [], repoName) : undefined;
     if (repo?.error) {
       failures.push(name + ": " + repo.error);
       continue;
@@ -272,23 +276,43 @@ async function prepare(host: OrcaHost, job: Job, targets: string[], poll: number
       : undefined;
     if (agents?.error !== undefined || repos.error !== undefined) {
       const error = agents?.error ?? repos.error;
-      host.log(job.id + " preflight on " + name + " failed (" + error + ")");
+      host.log("Preflight on " + name + " failed (" + error + ")");
       failures.push(name + ": unreachable");
       continue;
     }
-    if (!agents?.value.agents?.some((agent) => agent.id === "codex")) {
+    if (!repo?.id || !agents?.value.agents?.some((agent) => agent.id === "codex")) {
       failures.push(name + ": Codex unavailable");
       continue;
     }
+    return { name, repoId: repo.id };
+  }
+  return { failures };
+}
+
+async function prepare(host: OrcaHost, job: Job, targets: string[], poll: number) {
+  const candidates =
+    job.target === "desktop" ? ["macbook", "mini"] : job.target === "auto" ? targets : [job.target];
+  const placement = job.repo_id
+    ? { name: job.target, repoId: job.repo_id }
+    : await findPlacement(host, candidates, job.repo);
+  if (!("failures" in placement)) {
     // Persist the host before a mutating call. An ambiguous launch stays on that host.
-    const selected = { ...job, state: "launching", host: name, repo_id: repo?.id, due: 0 };
+    const selected = {
+      ...job,
+      state: "launching",
+      host: placement.name,
+      repo_id: placement.repoId,
+      due: 0,
+    };
     await host.save(selected, []);
     await launch(host, selected, true, poll);
-    return;
+  } else if (job.target === "desktop") {
+    await host.save({ ...job, due: host.now() + 300 }, []);
+  } else {
+    await host.save(finishedState(job), [
+      "Orca could not start this task. " + placement.failures?.join("; ") + ".",
+    ]);
   }
-  await host.save(finishedState(job), [
-    "Orca could not start this task. " + failures.join("; ") + ".",
-  ]);
 }
 
 async function read(host: OrcaHost, job: Job, poll: number, limit: number) {

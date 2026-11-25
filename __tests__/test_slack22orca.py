@@ -39,12 +39,60 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         self.orca = SimpleNamespace(call=AsyncMock())
         self.relay = plugin.Relay(self.store, self.orca, self.adapter)
 
-    def submit(self, **overrides):
+    def request(self, **overrides):
         params = dict(
             channel=CHANNEL, thread=THREAD, message=MESSAGE, team=TEAM, actor=OWNER,
             target="auto", repo="demo", task="Check the test run",
         )
-        return plugin.submit(self.store, **(params | overrides))
+        return params | overrides
+
+    def submit(self, **overrides):
+        return plugin.submit(self.store, **self.request(**overrides))
+
+    async def test_model_can_fall_back_to_dot_before_any_orca_launch(self):
+        job = plugin.request_job(**self.request(target="macbook"))
+        self.orca.call.side_effect = plugin.OrcaError("remote_runtime_unavailable")
+        result = await self.relay.submit_from_model(job)
+        self.assertEqual(result["status"], "desktop_unavailable")
+        self.assertEqual(self.store.due_jobs(set()), [])
+        self.orca.call.assert_awaited_once_with("macbook", "repo", "list", timeout=12)
+
+    async def test_model_queues_macbook_launch_once_after_preflight(self):
+        job = plugin.request_job(**self.request(target="macbook"))
+        self.orca.call.side_effect = [
+            {"repos": [REPO]}, {"agents": [{"id": "codex"}]},
+            {"launch": {"outcome": {"kind": "structured", "sessionId": "session-1"},
+                        "prompt": {"outcome": "journaled"}}},
+        ]
+        self.assertEqual((await self.relay.submit_from_model(job))["status"], "queued")
+        self.assertEqual((await self.relay.submit_from_model(job))["status"], "already_queued")
+        await self.relay.tick(self.store.due_jobs(set())[0])
+        self.assertEqual([call.args[:3] for call in self.orca.call.call_args_list], [
+            ("macbook", "repo", "list"), ("macbook", "agent", "installed"),
+            ("macbook", "worktree", "create"),
+        ])
+
+    async def test_deferred_device_check_survives_restart_and_never_uses_cloud(self):
+        self.orca.call.side_effect = [
+            plugin.OrcaError("remote_runtime_unavailable"),
+            plugin.OrcaError("remote_runtime_unavailable"),
+            plugin.OrcaError("remote_runtime_unavailable"),
+            {"repos": [REPO]}, {"agents": [{"id": "codex"}]},
+            {"launch": {"outcome": {"kind": "structured", "sessionId": "session-2"},
+                        "prompt": {"outcome": "journaled"}}},
+        ]
+        job = plugin.request_job(**self.request(target="desktop", task="Verify commit abc on the phone"))
+        self.assertEqual((await self.relay.submit_from_model(job))["status"], "queued")
+        await self.relay.tick(self.store.due_jobs(set())[0])
+        self.assertEqual(self.store.due_jobs(set()), [])
+        self.assertIsNone(self.store.next_message())
+        reopened = plugin.Store(self.store.directory)
+        relay = plugin.Relay(reopened, self.orca, self.adapter)
+        with patch.object(plugin.time, "time", return_value=plugin.time.time() + 301):
+            await relay.tick(reopened.due_jobs(set())[0])
+        self.assertEqual([call.args[0] for call in self.orca.call.call_args_list],
+                         ["macbook", "mini", "macbook", "mini", "mini", "mini"])
+        self.assertIn("Verify commit abc on the phone", self.orca.call.call_args.args[-1])
 
     async def test_falls_back_before_launch_and_relays_each_message_in_original_thread(self):
         self.orca.call.side_effect = [

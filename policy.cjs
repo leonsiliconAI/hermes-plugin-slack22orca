@@ -75,7 +75,7 @@ function delegation(request, owner, targets, limit) {
 	const { channel, thread, message, actor, target, repo, task } = request;
 	if (!actor || actor !== owner) return { error: "Orca delegation is available to the configured Slack user." };
 	if (!channel || !slackChannel.test(channel) || !thread || !slackTs.test(thread) || !message || !slackTs.test(message)) return { error: "Orca delegation needs a Slack message and its thread." };
-	if (target !== "auto" && !targets.includes(target ?? "") || typeof task !== "string" || !task.trim()) return { error: "Usage: !orca [auto|macbook|mini|cloud] [repo=<name>] <task>" };
+	if (target !== "auto" && !targets.includes(target ?? "") || typeof task !== "string" || !task.trim()) return { error: "Usage: !orca [auto|macbook|mini|cloud|desktop] [repo=<name>] <task>" };
 	if (Array.from(task).length > limit || task.includes("\0")) return { error: "Task must be at most " + limit + " characters and contain no NUL." };
 	if (typeof repo !== "string" || Array.from(repo).length > 250) return { error: "Use a registered Orca repository name or its canonical Git remote." };
 	return { prompt: "This task was delegated by Hermes from Slack. Your user-visible messages will be relayed into the original Slack thread as you work. Keep progress and the final result useful for that audience, and keep secrets out of your messages.\n\nSlack request: " + slackPermalink(channel, message) + "\n\n" + task.trim() };
@@ -179,11 +179,11 @@ async function launch(host, job, first, poll) {
 		due: host.now() + poll
 	}, []);
 }
-async function prepare(host, job, targets, poll) {
+async function findPlacement(host, targets, repoName) {
 	const failures = [];
-	for (const name of job.target === "auto" ? targets : [job.target]) {
+	for (const name of targets) {
 		const repos = await host.command(name, ["repo", "list"], 12);
-		const repo = repos.error === void 0 ? repository(repos.value.repos ?? [], job.repo) : void 0;
+		const repo = repos.error === void 0 ? repository(repos.value.repos ?? [], repoName) : void 0;
 		if (repo?.error) {
 			failures.push(name + ": " + repo.error);
 			continue;
@@ -191,26 +191,42 @@ async function prepare(host, job, targets, poll) {
 		const agents = repo ? await host.command(name, ["agent", "installed"], 12) : void 0;
 		if (agents?.error !== void 0 || repos.error !== void 0) {
 			const error = agents?.error ?? repos.error;
-			host.log(job.id + " preflight on " + name + " failed (" + error + ")");
+			host.log("Preflight on " + name + " failed (" + error + ")");
 			failures.push(name + ": unreachable");
 			continue;
 		}
-		if (!agents?.value.agents?.some((agent) => agent.id === "codex")) {
+		if (!repo?.id || !agents?.value.agents?.some((agent) => agent.id === "codex")) {
 			failures.push(name + ": Codex unavailable");
 			continue;
 		}
+		return {
+			name,
+			repoId: repo.id
+		};
+	}
+	return { failures };
+}
+async function prepare(host, job, targets, poll) {
+	const candidates = job.target === "desktop" ? ["macbook", "mini"] : job.target === "auto" ? targets : [job.target];
+	const placement = job.repo_id ? {
+		name: job.target,
+		repoId: job.repo_id
+	} : await findPlacement(host, candidates, job.repo);
+	if (!("failures" in placement)) {
 		const selected = {
 			...job,
 			state: "launching",
-			host: name,
-			repo_id: repo?.id,
+			host: placement.name,
+			repo_id: placement.repoId,
 			due: 0
 		};
 		await host.save(selected, []);
 		await launch(host, selected, true, poll);
-		return;
-	}
-	await host.save(finishedState(job), ["Orca could not start this task. " + failures.join("; ") + "."]);
+	} else if (job.target === "desktop") await host.save({
+		...job,
+		due: host.now() + 300
+	}, []);
+	else await host.save(finishedState(job), ["Orca could not start this task. " + placement.failures?.join("; ") + "."]);
 }
 async function read(host, job, poll, limit) {
 	const response = await host.command(job.host, [
@@ -256,6 +272,7 @@ exports.advance = advance;
 exports.command = command;
 exports.deferJob = deferJob;
 exports.delegation = delegation;
+exports.findPlacement = findPlacement;
 exports.finishedState = finishedState;
 exports.launchSession = launchSession;
 exports.recoveredSession = recoveredSession;

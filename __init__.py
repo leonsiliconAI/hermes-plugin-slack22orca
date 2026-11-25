@@ -17,6 +17,7 @@ from ._pythonmonkey import acall, call, on_host
 
 logger = logging.getLogger(__name__)
 TARGETS = ("macbook", "mini", "cloud")
+REQUEST_TARGETS = (*TARGETS, "desktop")
 POLL_SECONDS = 3
 TRANSCRIPT_LIMIT = 100
 TASK_LIMIT = 12_000
@@ -103,6 +104,10 @@ class Store:
                 (job["id"], json.dumps(job)),
             ).rowcount == 1
 
+    def has(self, job_id):
+        with self.connection() as db:
+            return db.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone() is not None
+
     def save(self, job, *messages):
         with self.connection() as db:
             db.execute(
@@ -174,12 +179,29 @@ class Relay:
         job.update(snapshot)
         self.store.save(job, *messages)
 
+    async def command(self, device, args, timeout):
+        try:
+            return {"value": await self.orca.call(device, *args, timeout=timeout)}
+        except OrcaError as exc:
+            return {"error": str(exc), "retry": exc.data.get("operationId")}
+
+    @staticmethod
+    def log(message):
+        logger.info("slack22orca: %s", message)
+
+    async def submit_from_model(self, job):
+        if self.store.has(job["id"]):
+            return {"status": "already_queued", "job": job["id"]}
+        if job["target"] in ("macbook", "mini"):
+            placement = await acall(__file__, "findPlacement", {
+                "command": on_host(self.command), "log": self.log,
+            }, [job["target"]], job["repo"])
+            if "repoId" not in placement:
+                return {"status": "desktop_unavailable", "reasons": placement["failures"]}
+            job["repo_id"] = placement["repoId"]
+        return queue_job(self.store, job)
+
     async def tick(self, job):
-        async def command(device, args, timeout):
-            try:
-                return {"value": await self.orca.call(device, *args, timeout=timeout)}
-            except OrcaError as exc:
-                return {"error": str(exc), "retry": exc.data.get("operationId")}
 
         def save(snapshot, messages):
             self.store.save(snapshot, *messages)
@@ -187,10 +209,10 @@ class Relay:
             job.update(snapshot)
 
         host = {
-            "command": on_host(command), "save": on_host(save),
+            "command": on_host(self.command), "save": on_host(save),
             "keys": on_host(lambda entries: [_entry_key(entry) for entry in entries]),
             "now": lambda: time.time(),
-            "log": lambda message: logger.info("slack22orca: %s", message),
+            "log": self.log,
         }
         try:
             await acall(__file__, "advance", host, job, list(TARGETS), POLL_SECONDS, TRANSCRIPT_LIMIT)
@@ -248,24 +270,37 @@ class Relay:
                     tasks.create_task(self.post())
 
 
-def submit(store, *, channel, thread, message, team, actor, target, repo, task):
+def request_job(*, channel, thread, message, team, actor, target, repo, task):
     allowed = os.getenv("SLACK22ORCA_USER_ID") or os.getenv("AUTOLINEAR_USER_ID")
     request = call(__file__, "delegation", {
         "channel": channel, "thread": thread, "message": message, "actor": actor,
         "target": target, "repo": repo, "task": task,
-    }, allowed, list(TARGETS), TASK_LIMIT)
+    }, allowed, list(REQUEST_TARGETS), TASK_LIMIT)
     if "error" in request:
         return request
-    if store is None:
-        return {"error": "Orca delegation is unavailable until the Slack adapter connects."}
     repo = repo or os.getenv("SLACK22ORCA_REPO", "leonsilicon.ai")
-    key = json.dumps([team, channel, message])
+    route = [team, channel, message]
+    if target == "desktop":
+        route.append(target)
+    key = json.dumps(route)
     job_id = hashlib.sha256(key.encode()).hexdigest()[:16]
-    fresh = store.add({
+    return {
         "id": job_id, "state": "queued", "due": 0, "channel": channel, "team": team,
         "thread": thread, "target": target, "repo": repo, "prompt": request["prompt"],
-    })
-    return {"status": "queued" if fresh else "already_queued", "job": job_id}
+    }
+
+
+def queue_job(store, job):
+    if "error" in job:
+        return job
+    if store is None:
+        return {"error": "Orca delegation is unavailable until the Slack adapter connects."}
+    fresh = store.add(job)
+    return {"status": "queued" if fresh else "already_queued", "job": job["id"]}
+
+
+def submit(store, **kwargs):
+    return queue_job(store, request_job(**kwargs))
 
 
 def register(ctx):
@@ -277,7 +312,7 @@ def register(ctx):
     def command(raw_args, *, source=None, platform=None):
         if platform != "slack" or source is None or source.is_bot:
             return "Run !orca from a Slack conversation."
-        args = call(__file__, "command", raw_args, list(TARGETS))
+        args = call(__file__, "command", raw_args, list(REQUEST_TARGETS))
         result = enqueue(
             channel=source.chat_id, thread=source.thread_id or source.message_id,
             message=source.message_id, team=source.scope_id or "", actor=source.user_id,
@@ -285,19 +320,22 @@ def register(ctx):
         )
         return result.get("error") or f"Orca {result['status'].replace('_', ' ')} ({result['job']})."
 
-    def delegate(args):
+    async def delegate(args, **_):
         from gateway.session_context import get_session_env
 
         if get_session_env("HERMES_SESSION_PLATFORM") != "slack":
             return {"error": "Delegate from the Slack conversation that should receive Orca's messages."}
         message = get_session_env("HERMES_SESSION_MESSAGE_ID")
-        return enqueue(
+        job = request_job(
             channel=get_session_env("HERMES_SESSION_CHAT_ID"),
             thread=get_session_env("HERMES_SESSION_THREAD_ID") or message, message=message,
             team=get_session_env("HERMES_SESSION_SCOPE_ID") or "",
             actor=get_session_env("HERMES_SESSION_ACTOR_ID"),
-            target=args.get("target", "auto"), repo=args.get("repo", ""), task=args.get("task"),
+            target=args.get("target", "macbook"), repo=args.get("repo", ""), task=args.get("task"),
         )
+        if relay is None or "error" in job:
+            return queue_job(None, job)
+        return await relay.submit_from_model(job)
 
     def wire(_native, adapter):
         nonlocal relay
@@ -326,19 +364,23 @@ def register(ctx):
 
     ctx.register_platform_handler("slack", wire)
     ctx.register_command("orca", handler=command, description="Delegate a task to Orca in this Slack thread.",
-                         args_hint="[auto|macbook|mini|cloud] [repo=<name>] <task>")
+                         args_hint="[auto|macbook|mini|cloud|desktop] [repo=<name>] <task>")
     ctx.register_tool(
-        name="slack22orca_delegate", toolset="slack22orca", handler=delegate,
+        name="slack22orca_delegate", toolset="slack22orca", handler=delegate, is_async=True,
         schema={
             "name": "slack22orca_delegate",
-            "description": "Delegate work to Orca. Its messages are posted to the current Slack thread.",
+            "description": "Delegate work to Orca and relay its messages to this Slack thread. Defaults to "
+                           "MacBook. If the MacBook cannot take the task, desktop_unavailable means "
+                           "nothing was queued and you can start cloud work through Silicon Dot.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task": {"type": "string", "description": "Self-contained brief for the Orca agent."},
                     "repo": {"type": "string", "description": "Registered Orca repository name or canonical Git remote."},
-                    "target": {"type": "string", "enum": ["auto", *TARGETS],
-                               "description": "auto tries MacBook, Mac mini, then Hermes Cloud."},
+                    "target": {"type": "string", "enum": ["auto", *REQUEST_TARGETS], "default": "macbook",
+                               "description": "Use desktop to queue device-only work until MacBook or Mac mini "
+                                              "is ready. auto is the explicit legacy route through MacBook, "
+                                              "Mac mini and Orca on Hermes Cloud."},
                 },
                 "required": ["task"],
             },

@@ -11,11 +11,12 @@ In a conversation where Hermes answers, type `!orca <task>`. Mention Hermes if t
 !orca macbook Investigate the local dev build
 !orca mini repo=leonsilicon.ai Review the latest changes
 !orca cloud repo=github.com/leonsilicon/leonsilicon.ai Check the release workflow
+!orca desktop repo=leonsilicon.ai Verify the linked build on the connected phone
 ```
 
-Hermes can call `slack22orca_delegate` during a Slack model turn with a self-contained `task`, optional `repo`, and optional `target`. The gateway supplies the Slack route from the current turn. AutoLinear’s ordinary Silicon Dot handoff stays on its existing route. The `!orca` command bypasses that handoff.
+Hermes can call `slack22orca_delegate` during a Slack model turn with a self-contained `task`, optional `repo`, and optional `target`. The gateway supplies the Slack route from the current turn. The model tool defaults to `macbook` and checks the requested repository and Codex before queuing the launch. `desktop_unavailable` means no launch was queued, so Hermes can start the work through Silicon Dot in a Codex cloud environment.
 
-Automatic placement tries MacBook, Mac mini, then the Orca daemon on Hermes Cloud. Each candidate needs the requested repository registered in Orca and Codex installed. Choose an explicit target when the task needs that host’s files. Worktrees use the repository’s default base and skip setup hooks.
+Use `target: desktop` for deferred checks that require local hardware. Include the branch or commit and the verification steps. Orca tries the MacBook first and then the Mac mini. If neither can take the job, the gateway keeps it queued across restarts and retries every five minutes. The agent checks whether the required hardware is connected before reporting verification. Explicit `auto`, the default for `!orca`, tries MacBook, Mac mini, then Orca on Hermes Cloud. Every candidate needs the repository registered and Codex installed. Worktrees use the repository’s default base and skip setup hooks.
 
 ## Install on Hermes Cloud
 
