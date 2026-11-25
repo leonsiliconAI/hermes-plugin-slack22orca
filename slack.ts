@@ -17,3 +17,8 @@ export function agentGroup(id: unknown) {
 export function slackPermalink(channel: string, ts: string) {
   return "https://app.slack.com/archives/" + channel + "/p" + ts.replaceAll(".", "");
 }
+
+export function issueChannel(name: string, prefix: string) {
+  if (!name.startsWith(prefix + "-")) return false;
+  return /^\p{Decimal_Number}+(?:-|$)/u.test(name.slice(prefix.length + 1));
+}
