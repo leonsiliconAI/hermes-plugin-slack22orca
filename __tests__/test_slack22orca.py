@@ -4,6 +4,7 @@ import sys
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -216,3 +217,23 @@ class TranscriptTests(unittest.TestCase):
         chunks = list(plugin.slack_chunks(text))
         self.assertTrue(all(len(chunk) <= 4000 for chunk in chunks))
         self.assertEqual("".join(chunk.removeprefix("Orca\n") for chunk in chunks), text)
+
+    def test_a_chunk_ends_at_a_line_break_in_its_tail(self):
+        text = "a" * 3500 + "\n" + "b" * 2000 + "\n" + "c" * 6000
+        chunks = [chunk.removeprefix("Orca\n") for chunk in plugin.slack_chunks(text)]
+        self.assertEqual("".join(chunks), text)
+        # The first break is in the chunk's tail and is used; the second is too early in its chunk.
+        self.assertEqual([len(chunk) for chunk in chunks], [3501, 3800, 3800, 401])
+
+    def test_one_long_line_takes_time_in_proportion_to_its_length(self):
+        # JavaScript holds Python's interpreter lock while it runs, so a search that went back to the
+        # start of the text for every chunk stopped all of Hermes for the square of the length.
+        def seconds(length):
+            started = time.perf_counter()
+            list(plugin.slack_chunks("x" * length))
+            return time.perf_counter() - started
+
+        seconds(1000)
+        small = min(seconds(800_000), seconds(800_000))
+        large = min(seconds(3_200_000), seconds(3_200_000))
+        self.assertLess(large, max(8 * small, 0.5))

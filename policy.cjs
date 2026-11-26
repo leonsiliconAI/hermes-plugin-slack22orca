@@ -36,8 +36,10 @@ function slackChunks(text) {
 	for (let start = 0; start < characters.length;) {
 		let end = Math.min(characters.length, start + 3800);
 		if (end < characters.length) {
-			const newline = characters.lastIndexOf("\n", end - 1);
-			if (newline >= start + 3e3) end = newline + 1;
+			for (let index = end - 1; index >= start + 3e3; index--) if (characters[index] === "\n") {
+				end = index + 1;
+				break;
+			}
 		}
 		chunks.push("Orca\n" + characters.slice(start, end).join(""));
 		start = end;
