@@ -13,7 +13,7 @@ import sqlite3
 import time
 from contextlib import closing, contextmanager, suppress
 
-from ._pythonmonkey import acall, call, on_host
+from ._bridge import acall, call, on_host
 
 logger = logging.getLogger(__name__)
 TARGETS = ("macbook", "mini", "cloud")

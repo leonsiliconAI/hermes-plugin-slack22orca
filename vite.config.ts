@@ -3,7 +3,11 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite-plus";
 
-const runtime = fileURLToPath(new URL("./_pythonmonkey.py", import.meta.url));
+// The bridge and the worker it starts, which each plugin ships beside its bundle.
+const shipped = ["_bridge.py", "bridge.cjs"].map((name) => ({
+  name,
+  path: fileURLToPath(new URL("./" + name, import.meta.url)),
+}));
 const slack = fileURLToPath(new URL("./slack.ts", import.meta.url));
 const slackModule = "\0hermes-slack.ts";
 
@@ -20,12 +24,10 @@ export default defineConfig({
       {
         name: "hermes-plugin-files",
         buildStart() {
-          if (runtime !== resolve("_pythonmonkey.py")) this.addWatchFile(runtime);
-          this.emitFile({
-            type: "asset",
-            fileName: "_pythonmonkey.py",
-            source: readFileSync(runtime),
-          });
+          for (const { name, path } of shipped) {
+            if (path !== resolve(name)) this.addWatchFile(path);
+            this.emitFile({ type: "asset", fileName: name, source: readFileSync(path) });
+          }
         },
         resolveId(source) {
           if (source === "#slack") return slackModule;
